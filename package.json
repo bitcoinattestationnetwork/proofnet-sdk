@@ -1,0 +1,17 @@
+{
+  "name": "@proofnet/sdk",
+  "version": "0.1.2",
+  "description": "Proofnet BTC SDK (HTTP client helpers) for apps that talk to Proofnet BTC core services.",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}
