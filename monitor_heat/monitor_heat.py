@@ -6,31 +6,63 @@ Zero external dependencies — uses only stdlib + WMI/PowerShell queries.
 """
 
 import ctypes
-import os
+import csv
+import io
 import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
 
-LOG_FILE = Path.home() / "system_monitor.log"
+LOG_DIR = Path.home() / "proofnet-monitor-logs"
+LOG_FILE = LOG_DIR / f"system_monitor_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+POWERSHELL_TIMEOUT_SECS = 8
+PROCESS_SNAPSHOT_TIMEOUT_SECS = 12
+SAMPLE_INTERVAL_SECS = 5
 
 # Processes to exclude from "top consumers" (noise, not real load)
 EXCLUDED_PROCS = {"system idle process", "system", "idle", "memory compression"}
+
+
+def run_powershell(script, timeout=POWERSHELL_TIMEOUT_SECS):
+    """Run a bounded PowerShell query and return stdout, or None if unavailable."""
+    cmd = [
+        "powershell",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        script,
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout
 
 
 def get_cpu_percent(interval=1):
     """Get overall CPU usage % by sampling twice with a delay (no psutil)."""
     def _read_idle_and_total():
         # Use PowerShell to read Win32_PerfRawData_PerfOS_Processor (_Total)
-        cmd = (
-            'powershell -NoProfile -Command "'
-            'Get-CimInstance Win32_PerfRawData_PerfOS_Processor '
-            "-Filter \\\"Name='_Total'\\\" | "
-            'Select-Object -Property PercentIdleTime,TimeStamp_Sys100NS | '
-            'ForEach-Object { $_.PercentIdleTime; $_.TimeStamp_Sys100NS }"'
+        script = (
+            "Get-CimInstance Win32_PerfRawData_PerfOS_Processor "
+            "-Filter \"Name='_Total'\" | "
+            "Select-Object -Property PercentIdleTime,TimeStamp_Sys100NS | "
+            "ForEach-Object { $_.PercentIdleTime; $_.TimeStamp_Sys100NS }"
         )
-        result = subprocess.run(cmd, capture_output=True, text=True, shell=True)
-        lines = [l.strip() for l in result.stdout.strip().split('\n') if l.strip()]
+        stdout = run_powershell(script)
+        if stdout is None:
+            return None, None
+        lines = [l.strip() for l in stdout.strip().split('\n') if l.strip()]
         if len(lines) >= 2:
             return int(lines[0]), int(lines[1])
         return None, None
@@ -51,6 +83,9 @@ def get_cpu_percent(interval=1):
 
 def get_memory():
     """Get memory usage via kernel32 GlobalMemoryStatusEx (no psutil)."""
+    if not hasattr(ctypes, "windll"):
+        return None, None, None
+
     class MEMORYSTATUSEX(ctypes.Structure):
         _fields_ = [
             ("dwLength", ctypes.c_ulong),
@@ -66,7 +101,8 @@ def get_memory():
 
     mem = MEMORYSTATUSEX()
     mem.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(mem))
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(mem)):
+        return None, None, None
 
     total_gb = mem.ullTotalPhys / (1024 ** 3)
     used_gb = (mem.ullTotalPhys - mem.ullAvailPhys) / (1024 ** 3)
@@ -82,12 +118,14 @@ def get_disk(drive="C:"):
         free_bytes = ctypes.c_ulonglong(0)
         total_bytes = ctypes.c_ulonglong(0)
         free_avail = ctypes.c_ulonglong(0)
-        ctypes.windll.kernel32.GetDiskFreeSpaceExW(
+        ok = ctypes.windll.kernel32.GetDiskFreeSpaceExW(
             drive + "\\",
             ctypes.byref(free_avail),
             ctypes.byref(total_bytes),
             ctypes.byref(free_bytes),
         )
+        if not ok:
+            return None
         total = total_bytes.value
         free = free_avail.value
         used = total - free
@@ -99,41 +137,39 @@ def get_disk(drive="C:"):
 
 
 def get_cpu_temp():
-    """Get CPU temperature using multiple WMI methods."""
+    """Get temperature using multiple Windows sensor methods."""
     # Method 1: MSAcpi_ThermalZoneTemperature (requires admin)
     try:
-        cmd = (
-            'powershell -NoProfile -Command "'
+        script = (
             "Get-CimInstance -Namespace root/WMI "
             "-ClassName MSAcpi_ThermalZoneTemperature "
-            '-ErrorAction Stop | Select-Object -First 1 -ExpandProperty CurrentTemperature"'
+            "-ErrorAction Stop | Select-Object -First 1 -ExpandProperty CurrentTemperature"
         )
-        result = subprocess.run(cmd, capture_output=True, text=True, shell=True)
-        val = result.stdout.strip()
-        if val and result.returncode == 0:
+        stdout = run_powershell(script)
+        val = stdout.strip() if stdout else ""
+        if val:
             temp_celsius = (float(val) - 2732) / 10
             if 0 < temp_celsius < 150:
-                return round(temp_celsius, 1)
+                return round(temp_celsius, 1), "MSAcpi_ThermalZoneTemperature"
     except Exception:
         pass
 
     # Method 2: Win32_TemperatureProbe
     try:
-        cmd = (
-            'powershell -NoProfile -Command "'
+        script = (
             "Get-CimInstance Win32_TemperatureProbe "
-            '-ErrorAction Stop | Select-Object -First 1 -ExpandProperty CurrentReading"'
+            "-ErrorAction Stop | Select-Object -First 1 -ExpandProperty CurrentReading"
         )
-        result = subprocess.run(cmd, capture_output=True, text=True, shell=True)
-        val = result.stdout.strip()
-        if val and result.returncode == 0:
+        stdout = run_powershell(script)
+        val = stdout.strip() if stdout else ""
+        if val:
             temp = float(val)
             if 0 < temp < 150:
-                return round(temp, 1)
+                return round(temp, 1), "Win32_TemperatureProbe"
     except Exception:
         pass
 
-    return None
+    return None, None
 
 
 def get_top_processes(n=5):
@@ -143,31 +179,27 @@ def get_top_processes(n=5):
     which processes consumed the most CPU in that window.
     """
     def _snapshot():
-        cmd = (
-            'powershell -NoProfile -Command "'
+        script = (
             "Get-Process | Where-Object { $_.ProcessName -ne 'Idle' } | "
             "Select-Object Id,ProcessName,"
             "@{N='CPU_ms';E={[long]$_.TotalProcessorTime.TotalMilliseconds}},"
             "@{N='Mem_MB';E={[math]::Round($_.WorkingSet64/1MB,1)}} | "
-            'ConvertTo-Csv -NoTypeInformation"'
+            "ConvertTo-Csv -NoTypeInformation"
         )
-        result = subprocess.run(cmd, capture_output=True, text=True, shell=True)
+        stdout = run_powershell(script, timeout=PROCESS_SNAPSHOT_TIMEOUT_SECS)
+        if stdout is None:
+            return {}
         procs = {}
-        for line in result.stdout.strip().split('\n')[1:]:  # skip header
-            line = line.strip().strip('"')
-            if not line:
+        for row in csv.DictReader(io.StringIO(stdout)):
+            try:
+                pid = int(row.get("Id", ""))
+                name = row.get("ProcessName", "")
+                cpu_ms = float(row.get("CPU_ms") or 0)
+                mem_mb = float(row.get("Mem_MB") or 0)
+                if name.lower() not in EXCLUDED_PROCS:
+                    procs[pid] = {"name": name, "cpu_ms": cpu_ms, "mem_mb": mem_mb}
+            except (TypeError, ValueError):
                 continue
-            parts = [p.strip('"') for p in line.split('","')]
-            if len(parts) >= 4:
-                try:
-                    pid = int(parts[0])
-                    name = parts[1]
-                    cpu_ms = float(parts[2]) if parts[2] else 0
-                    mem_mb = float(parts[3]) if parts[3] else 0
-                    if name.lower() not in EXCLUDED_PROCS:
-                        procs[pid] = {"name": name, "cpu_ms": cpu_ms, "mem_mb": mem_mb}
-                except (ValueError, IndexError):
-                    continue
         return procs
 
     snap1 = _snapshot()
@@ -176,7 +208,7 @@ def get_top_processes(n=5):
 
     # Get total physical memory for percentage calculation
     _, _, total_gb = get_memory()
-    total_mb = total_gb * 1024
+    total_mb = (total_gb or 0) * 1024
 
     deltas = []
     for pid, info2 in snap2.items():
@@ -201,18 +233,21 @@ def log_system_state():
     cpu_pct = get_cpu_percent(interval=1)
     mem_pct, mem_used, mem_total = get_memory()
     disk_pct = get_disk("C:")
-    temp = get_cpu_temp()
+    temp, temp_source = get_cpu_temp()
 
     log_entry = f"\n{'='*70}\n"
     log_entry += f"Timestamp: {timestamp}\n"
     log_entry += f"CPU Usage: {cpu_pct}%\n" if cpu_pct is not None else "CPU Usage: N/A\n"
-    log_entry += f"Memory: {mem_pct}% ({mem_used}GB / {mem_total}GB)\n"
+    if mem_pct is not None:
+        log_entry += f"Memory: {mem_pct}% ({mem_used}GB / {mem_total}GB)\n"
+    else:
+        log_entry += "Memory: N/A\n"
     if disk_pct is not None:
         log_entry += f"Disk: {disk_pct}% full\n"
     if temp is not None:
-        log_entry += f"CPU Temperature: {temp}C\n"
+        log_entry += f"Temperature: {temp}C ({temp_source})\n"
     else:
-        log_entry += "CPU Temperature: N/A (run as admin for WMI access)\n"
+        log_entry += "Temperature: N/A (Windows did not expose a readable sensor)\n"
 
     log_entry += f"\nTop 5 CPU-consuming processes:\n"
     log_entry += f"{'-'*70}\n"
@@ -239,16 +274,16 @@ def main():
     print(f"Logging to: {LOG_FILE}")
     print("Press Ctrl+C to stop.\n")
 
-    if LOG_FILE.exists():
-        with open(LOG_FILE, 'w') as f:
-            f.write(f"System Monitor Log - Started {datetime.now()}\n")
-
-    interval = 5  # seconds between samples
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(LOG_FILE, 'a') as f:
+        f.write(f"System Monitor Log - Started {datetime.now()}\n")
 
     try:
         while True:
+            started = time.monotonic()
             log_system_state()
-            time.sleep(interval)
+            elapsed = time.monotonic() - started
+            time.sleep(max(0, SAMPLE_INTERVAL_SECS - elapsed))
     except KeyboardInterrupt:
         print(f"\n\nMonitoring stopped. Log saved to: {LOG_FILE}")
 
